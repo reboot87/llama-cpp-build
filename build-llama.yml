@@ -131,8 +131,9 @@ jobs:
       - name: Resolve & verify DLL dependencies
         run: |
           $ErrorActionPreference = 'Stop'
-          $out   = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
-          $cache = 'llama.cpp\build\CMakeCache.txt'
+          $config = '${{ matrix.config }}'
+          $out    = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          $cache  = 'llama.cpp\build\CMakeCache.txt'
 
           $dumpbin = $null
           if ($env:VCToolsInstallDir) {
@@ -160,11 +161,36 @@ jobs:
               }
             }
           }
-          foreach ($d in ($env:PATH -split ';')) { if ($d -and (Test-Path $d)) { $searchDirs.Add($d) } }
           foreach ($d in @('C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin')) {
             if (Test-Path $d) { $searchDirs.Add($d) }
           }
+          # UCRT 调试版 ucrtbased.dll 在 Windows SDK 里，不在 VS Redist 里
+          if ($env:WindowsSdkDir -and $env:UCRTVersion) {
+            $sdkUcrt = Join-Path $env:WindowsSdkDir "bin\$env:UCRTVersion\x64\ucrt"
+            if (Test-Path $sdkUcrt) { $searchDirs.Add($sdkUcrt) }
+          }
+          Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\ucrt' -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { $searchDirs.Add($_.FullName) }
+          # PATH 放最后：优先用 SDK / 官方安装目录里的正版 DLL，而不是系统目录里的
+          foreach ($d in ($env:PATH -split ';')) { if ($d -and (Test-Path $d)) { $searchDirs.Add($d) } }
           $searchDirs = $searchDirs | Select-Object -Unique
+
+          # 必须随包分发的 CRT：目标机（没装 VC++ 运行时/VS）默认没有，
+          # 所以即使 CI 机器的 System32 里有，也要强制出现在产物里
+          $mustBundle = @(
+            'vcruntime140.dll', 'vcruntime140_1.dll', 'vcruntime140_threads.dll',
+            'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
+            'msvcp140_atomic_wait.dll', 'msvcp140_codecvt_ids.dll', 'concrt140.dll'
+          )
+          if ($config -eq 'Debug') {
+            $mustBundle += @(
+              'ucrtbased.dll',
+              'vcruntime140d.dll', 'vcruntime140_1d.dll', 'vcruntime140_threadsd.dll',
+              'msvcp140d.dll', 'msvcp140_1d.dll', 'msvcp140_2d.dll',
+              'msvcp140d_atomic_wait.dll', 'msvcp140d_codecvt_ids.dll', 'concrt140d.dll'
+            )
+          }
 
           $sysDirs  = @("$env:SystemRoot\System32", "$env:SystemRoot\SysWOW64")
           $resolved = @()
@@ -184,9 +210,11 @@ jobs:
               foreach ($dep in $deps) {
                 if ($have.ContainsKey($dep.ToLower())) { continue }
                 if ($dep -like 'api-ms-win-*' -or $dep -like 'ext-ms-*') { continue }
-                $inSystem = $false
-                foreach ($d in $sysDirs) { if (Test-Path (Join-Path $d $dep)) { $inSystem = $true; break } }
-                if ($inSystem) { continue }
+                if ($mustBundle -notcontains $dep.ToLower()) {
+                  $inSystem = $false
+                  foreach ($d in $sysDirs) { if (Test-Path (Join-Path $d $dep)) { $inSystem = $true; break } }
+                  if ($inSystem) { continue }
+                }
                 if (-not $missing.ContainsKey($dep)) { $missing[$dep] = @() }
                 if ($missing[$dep] -notcontains $bin.Name) { $missing[$dep] += $bin.Name }
               }
