@@ -58,7 +58,7 @@ jobs:
           cmake -B build -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_BUILD_TYPE=${{ matrix.config }} `
             -DBUILD_SHARED_LIBS=ON `
-            -DLLAMA_CURL=OFF `
+            -DLLAMA_OPENSSL=ON `
             -DGGML_NATIVE=OFF `
             -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON `
             -DLLAMA_BUILD_TESTS=OFF `
@@ -123,16 +123,16 @@ jobs:
           }
           $files | ForEach-Object { $_.Name }
 
-      - name: Verify DLL dependencies
+      # 依赖闭环校验：
+      #  1) dumpbin 扫描每个 exe/dll 的导入表
+      #  2) 缺失的 DLL 先尝试从 CMakeCache 推导的第三方 bin 目录 / PATH / 常见安装位置自动补齐
+      #     （llama.cpp 默认 LLAMA_OPENSSL=ON，会依赖 libssl-3-x64.dll / libcrypto-3-x64.dll）
+      #  3) 仍然缺失才判失败，避免上传跑不起来的包
+      - name: Resolve & verify DLL dependencies
         run: |
           $ErrorActionPreference = 'Stop'
-          $out = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
-
-          $dlls = @{}
-          Get-ChildItem -LiteralPath $out -Filter *.dll | ForEach-Object { $dlls[$_.Name.ToLower()] = $true }
-          if ($dlls.Count -eq 0) {
-            throw '产物里一个 DLL 都没有，检查 BUILD_SHARED_LIBS=ON 是否生效'
-          }
+          $out   = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          $cache = 'llama.cpp\build\CMakeCache.txt'
 
           $dumpbin = $null
           if ($env:VCToolsInstallDir) {
@@ -145,27 +145,80 @@ jobs:
             exit 0
           }
 
-          $sysDirs = @("$env:SystemRoot\System32", "$env:SystemRoot\SysWOW64")
-          $missing = @()
-          foreach ($bin in Get-ChildItem -LiteralPath $out -File | Where-Object { $_.Extension -in @('.exe', '.dll') }) {
-            $deps = & $dumpbin /nologo /dependents $bin.FullName 2>$null |
-              ForEach-Object { $_.Trim() } |
-              Where-Object { $_ -match '(?i)^[\w.\-]+\.dll$' }
-            foreach ($dep in $deps) {
-              $low = $dep.ToLower()
-              if ($dlls.ContainsKey($low)) { continue }
-              if ($low -like 'api-ms-win-*' -or $low -like 'ext-ms-*') { continue }
-              $inSystem = $false
-              foreach ($d in $sysDirs) { if (Test-Path (Join-Path $d $dep)) { $inSystem = $true; break } }
-              if ($inSystem) { continue }
-              $missing += "$($bin.Name)  ->  $dep"
+          # 第三方依赖 DLL 的搜索目录：CMakeCache 里 .lib 的同级/上级 bin + PATH + 常见安装位置
+          $searchDirs = New-Object System.Collections.Generic.List[string]
+          if (Test-Path $cache) {
+            foreach ($line in Get-Content $cache) {
+              if ($line -notmatch '^[A-Za-z0-9_]+:FILEPATH=(.+)$') { continue }
+              $libPath = $matches[1].Trim()
+              if ($libPath -notmatch '\.lib$') { continue }
+              $dir = Split-Path $libPath -Parent
+              for ($i = 0; $i -lt 6 -and $dir; $i++) {
+                $cand = Join-Path $dir 'bin'
+                if (Test-Path $cand) { $searchDirs.Add($cand) }
+                $dir = Split-Path $dir -Parent
+              }
             }
           }
+          foreach ($d in ($env:PATH -split ';')) { if ($d -and (Test-Path $d)) { $searchDirs.Add($d) } }
+          foreach ($d in @('C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin')) {
+            if (Test-Path $d) { $searchDirs.Add($d) }
+          }
+          $searchDirs = $searchDirs | Select-Object -Unique
 
+          $sysDirs  = @("$env:SystemRoot\System32", "$env:SystemRoot\SysWOW64")
+          $resolved = @()
+          $missing  = @{}
+
+          for ($pass = 1; $pass -le 3; $pass++) {
+            $have = @{}
+            Get-ChildItem -LiteralPath $out -Filter *.dll | ForEach-Object { $have[$_.Name.ToLower()] = $true }
+            if ($have.Count -eq 0) { throw '产物里一个 DLL 都没有，检查 BUILD_SHARED_LIBS=ON 是否生效' }
+
+            $missing = @{}
+            foreach ($bin in Get-ChildItem -LiteralPath $out -File | Where-Object { $_.Extension -in @('.exe', '.dll') }) {
+              $deps = & $dumpbin /nologo /dependents $bin.FullName 2>$null |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ -match '(?i)^[\w.\-]+\.dll$' } |
+                Select-Object -Unique
+              foreach ($dep in $deps) {
+                if ($have.ContainsKey($dep.ToLower())) { continue }
+                if ($dep -like 'api-ms-win-*' -or $dep -like 'ext-ms-*') { continue }
+                $inSystem = $false
+                foreach ($d in $sysDirs) { if (Test-Path (Join-Path $d $dep)) { $inSystem = $true; break } }
+                if ($inSystem) { continue }
+                if (-not $missing.ContainsKey($dep)) { $missing[$dep] = @() }
+                if ($missing[$dep] -notcontains $bin.Name) { $missing[$dep] += $bin.Name }
+              }
+            }
+            if ($missing.Count -eq 0) { break }
+
+            $added = 0
+            foreach ($dep in @($missing.Keys)) {
+              $src = $null
+              foreach ($d in $searchDirs) {
+                $cand = Join-Path $d $dep
+                if (Test-Path $cand) { $src = $cand; break }
+              }
+              if ($src) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $out $dep) -Force
+                $resolved += "$dep  <-  $src"
+                $added++
+              }
+            }
+            if ($added -eq 0) { break }
+          }
+
+          if ($resolved.Count -gt 0) {
+            '**已自动补齐第三方依赖 DLL：**' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            foreach ($r in $resolved) { "- ``$r``" | Add-Content -Path $env:GITHUB_STEP_SUMMARY }
+          }
           if ($missing.Count -gt 0) {
             '**依赖缺失，产物不完整：**' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
-            foreach ($m in $missing) { "- ``$m``" | Add-Content -Path $env:GITHUB_STEP_SUMMARY }
-            throw "缺少依赖 DLL: $($missing -join '; ')"
+            foreach ($dep in @($missing.Keys)) {
+              "- ``$dep``  被 $($missing[$dep] -join ', ') 需要" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            }
+            throw "缺少依赖 DLL: $(@($missing.Keys) -join '; ')"
           }
           '依赖校验通过：所有非系统 DLL 均已打包' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
 

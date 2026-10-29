@@ -29,4 +29,5 @@
 - 收集阶段会把 `build\bin\<Config>\` 下的 exe/dll/pdb 全部打包，并额外带上 VC 运行库：
   - Release：`Microsoft.VC143.CRT`（vcruntime140 / msvcp140）
   - Debug：额外带 `debug_nonredist\x64\Microsoft.VC143.DebugCRT`（`*d.dll`），否则目标机没装 VS 会直接报缺 DLL / 0xc000007b
-- 上传前有一道 **依赖校验**：用 `dumpbin /dependents` 逐个检查产物里每个 exe/dll 的依赖，凡是不在产物里、也不在系统 `System32` 里的 DLL 都会被列出来并让整个 job 失败，保证不会上传残缺的包。
+- llama.cpp 默认 `LLAMA_OPENSSL=ON`（`-hf` 走 HTTPS 下载模型需要），所以产物还会依赖 `libssl-3-x64.dll`、`libcrypto-3-x64.dll`，这两个会在校验阶段自动从 OpenSSL 安装目录补齐并一起打包。
+- 上传前有一道 **依赖闭环校验**：用 `dumpbin /dependents` 逐个检查产物里每个 exe/dll 的依赖，缺的 DLL 先自动补齐；补不到才让 job 失败并列出「哪个 DLL 被谁需要」，保证不会上传残缺的包。
