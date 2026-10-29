@@ -1,55 +1,179 @@
-# GitHub Actions workflow to build llama.cpp on Windows (MSVC)
-NAME: Build llama.cpp Windows MSVC
+# GitHub Actions workflow: 构建 llama.cpp (Windows / MSVC / x64)
+# 同时产出 Release 与 Debug 两个版本，并校验依赖 DLL 是否齐全
+# 放置位置: .github/workflows/build-llama.yml
+name: Build llama.cpp Windows MSVC
 
-ON:
+on:
   workflow_dispatch:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   build-windows:
-    runs-on: windows-ls:latest
-    # windows-2022
-    name: Windows MSVC build
+    name: Windows MSVC x64 (${{ matrix.config }})
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [ Release, Debug ]
+    defaults:
+      run:
+        shell: pwsh
+
     steps:
       - name: Checkout llama.cpp
         uses: actions/checkout@v4
         with:
           repository: ggml-org/llama.cpp
           path: llama.cpp
+          fetch-depth: 1
 
-      - name: Setup MSVC
-        uses: microsoft/setup-msbuild@v1.1
+      # 该 action 执行 vcvars64.bat，并导出 INCLUDE/LIB/VCToolsInstallDir/VCToolsRedistDir
+      # 后面收集 Debug CRT 与 dumpbin 校验都依赖这些环境变量
+      - name: Setup MSVC (vcvars64)
+        uses: ilammy/msvc-dev-cmd@v1
         with:
-          vsversion: '17.0'
+          arch: x64
 
-      - name: Setup CMake
-        uses: actions/setup-cmake@v1
+      - name: Show toolchain
+        run: |
+          cmake --version
+          "cl       : $((Get-Command cl.exe      -ErrorAction SilentlyContinue).Source)"
+          "dumpbin  : $((Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source)"
+          "RedistDir: $env:VCToolsRedistDir"
+          "Config   : ${{ matrix.config }}"
 
-      - name: Configure CMake (CPU + AVX2)
+      # BUILD_SHARED_LIBS=ON 才会产出 llama.dll / ggml.dll / ggml-base.dll / ggml-cpu.dll，
+      # 这些是运行时插件式加载的，缺一个 exe 就跑不起来
+      # GGML_NATIVE=OFF + 显式 AVX2：避免产物绑死 CI 机器的指令集（runner 可能带 AVX512）
+      - name: Configure CMake
         working-directory: llama.cpp
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ matrix.config }} `
+            -DBUILD_SHARED_LIBS=ON `
+            -DLLAMA_CURL=OFF `
+            -DGGML_NATIVE=OFF `
+            -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=ON `
+            -DLLAMA_BUILD_SERVER=ON
 
       - name: Build
         working-directory: llama.cpp
-        run: cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+        run: cmake --build build --config ${{ matrix.config }} --parallel $env:NUMBER_OF_PROCESSORS
 
-      - name: Collect artifacts
+      - name: Collect artifacts (exe + dll + pdb + CRT)
         run: |
-          mkdir artifacts
-          copy llama.cpp\build\bin\Release\*.exe artifacts\ 2>nul
-          copy llama.cpp\build\bin\Release\*.dll artifacts\ 2>nul
-          copy llama.cpp\build\Release\*.exe artifacts\ 2>nul
-          copy llama.cpp\build\Release\*.dll artifacts\ 2>nul
-          if exist llama.cpp\build\bin\*.exe copy llama.cpp\build\bin\*.exe artifacts\ 2>nul
-          dir /b artifacts
+          $ErrorActionPreference = 'Stop'
+          $config = '${{ matrix.config }}'
+          $out    = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          $build  = 'llama.cpp\build'
+
+          Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          # 1) 主产物目录：VS 多配置生成器落在 build\bin\<Config>\
+          foreach ($d in @("$build\bin\$config", "$build\bin", "$build\$config", $build)) {
+            if (-not (Test-Path $d)) { continue }
+            Get-ChildItem -LiteralPath $d -File |
+              Where-Object { $_.Extension -in @('.exe', '.dll', '.pdb') } |
+              Copy-Item -Destination $out -Force
+          }
+
+          # 2) 兜底：构建树里其它位置的 dll（第三方依赖等）也一并收进来
+          Get-ChildItem -LiteralPath $build -Recurse -File -Filter *.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
+            ForEach-Object {
+              $dest = Join-Path $out $_.Name
+              if (-not (Test-Path $dest)) { Copy-Item $_.FullName -Destination $dest -Force }
+            }
+
+          # 3) CRT 运行库：Release 带 vcruntime140/msvcp140，Debug 还必须带 *d.dll
+          #    Debug CRT 不在系统里，不随包分发目标机必然报缺少 dll / 0xc000007b
+          $patterns = @()
+          if ($env:VCToolsRedistDir) {
+            $patterns += "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT"
+            if ($config -eq 'Debug') {
+              $patterns += "$env:VCToolsRedistDir\debug_nonredist\x64\Microsoft.VC*.DebugCRT"
+            }
+          }
+          $patterns += 'C:\Program Files\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT'
+          if ($config -eq 'Debug') {
+            $patterns += 'C:\Program Files\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\debug_nonredist\x64\Microsoft.VC*.DebugCRT'
+          }
+          foreach ($p in $patterns) {
+            Get-ChildItem -Path $p -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              Get-ChildItem -LiteralPath $_.FullName -File -Filter *.dll -ErrorAction SilentlyContinue |
+                Copy-Item -Destination $out -Force
+            }
+          }
+
+          $files = Get-ChildItem -LiteralPath $out -File | Sort-Object Name
+          "### $config 产物：$($files.Count) 个文件" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          foreach ($f in $files) {
+            "- ``$($f.Name)``  $([math]::Round($f.Length / 1KB, 1)) KB" |
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          }
+          $files | ForEach-Object { $_.Name }
+
+      - name: Verify DLL dependencies
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+
+          $dlls = @{}
+          Get-ChildItem -LiteralPath $out -Filter *.dll | ForEach-Object { $dlls[$_.Name.ToLower()] = $true }
+          if ($dlls.Count -eq 0) {
+            throw '产物里一个 DLL 都没有，检查 BUILD_SHARED_LIBS=ON 是否生效'
+          }
+
+          $dumpbin = $null
+          if ($env:VCToolsInstallDir) {
+            $p = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\dumpbin.exe'
+            if (Test-Path $p) { $dumpbin = $p }
+          }
+          if (-not $dumpbin) { $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source }
+          if (-not $dumpbin) {
+            Write-Warning '未找到 dumpbin，跳过依赖校验'
+            exit 0
+          }
+
+          $sysDirs = @("$env:SystemRoot\System32", "$env:SystemRoot\SysWOW64")
+          $missing = @()
+          foreach ($bin in Get-ChildItem -LiteralPath $out -File | Where-Object { $_.Extension -in @('.exe', '.dll') }) {
+            $deps = & $dumpbin /nologo /dependents $bin.FullName 2>$null |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { $_ -match '(?i)^[\w.\-]+\.dll$' }
+            foreach ($dep in $deps) {
+              $low = $dep.ToLower()
+              if ($dlls.ContainsKey($low)) { continue }
+              if ($low -like 'api-ms-win-*' -or $low -like 'ext-ms-*') { continue }
+              $inSystem = $false
+              foreach ($d in $sysDirs) { if (Test-Path (Join-Path $d $dep)) { $inSystem = $true; break } }
+              if ($inSystem) { continue }
+              $missing += "$($bin.Name)  ->  $dep"
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            '**依赖缺失，产物不完整：**' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            foreach ($m in $missing) { "- ``$m``" | Add-Content -Path $env:GITHUB_STEP_SUMMARY }
+            throw "缺少依赖 DLL: $($missing -join '; ')"
+          }
+          '依赖校验通过：所有非系统 DLL 均已打包' | Add-Content -Path $env:GITHUB_STEP_SUMMARY
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: llama-cpp-windows-msvc-x64
-          path: artifacts/*
+          name: llama-cpp-windows-msvc-x64-${{ matrix.config }}
+          path: artifacts/**
           if-no-files-found: error
-    timeout-minutes: 60
+          retention-days: 30
+          compression-level: 6

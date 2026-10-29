@@ -1,0 +1,7 @@
+# WorkBuddy 项目数据
+.workbuddy-ai/
+
+# 本地构建产物
+build/
+artifacts/
+*.log
